@@ -1,3 +1,4 @@
+import math
 import os
 import json
 import uuid
@@ -6,11 +7,15 @@ import time
 import base64
 import pprint
 import shlex
+import shutil
+import pathlib
 
 from doodad.utils import shell
 from doodad.utils import safe_import
 from doodad import mount
 from doodad.apis import azure_util
+from doodad.apis.slurm_util import SlurmJobGenerator
+from doodad.utils import safe_import, shell, script_builder, cmd_builder
 from doodad.apis.ec2.autoconfig import Autoconfig
 from doodad.credentials.ec2 import AWSCredentials
 
@@ -29,9 +34,10 @@ class LaunchMode(object):
         shell_interpreter (str): Interpreter command for script. Default 'sh'
         async_run (bool): If True,
     """
-    def __init__(self, shell_interpreter='sh', async_run=False):
+    def __init__(self, shell_interpreter='sh', async_run=False, use_gpu=False):
         self.shell_interpreter = shell_interpreter
         self.async_run = async_run
+        self.use_gpu = use_gpu
 
     def run_script(self, script_filename, dry=False, return_output=False, verbose=False):
         """
@@ -43,12 +49,15 @@ class LaunchMode(object):
             verbose (bool): Verbose mode
             return_output (bool): If True, returns stdout from the script as a string.
         """
+        run_cmd = self._get_run_command(script_filename)
+        if verbose:
+            print('Executing command:', run_cmd)
         if return_output:
-            output = shell.call_and_get_output(self._get_run_command(script_filename), shell=True, dry=dry)
+            output = shell.call_and_get_output(run_cmd, shell=True, dry=dry)
             if output:
                 return output.decode('utf-8')
         else:
-            shell.call(self._get_run_command(script_filename), shell=True, dry=dry, wait=not self.async_run)
+            shell.call(run_cmd, shell=True, dry=dry, wait=not self.async_run)
 
     def _get_run_command(self, script_filename):
         raise NotImplementedError()
@@ -86,7 +95,6 @@ class EC2Mode(LaunchMode):
                  ec2_credentials,
                  s3_bucket,
                  s3_log_path,
-                 s3_log_prefix='ec2_experiment',
                  ami_name=None,
                  terminate_on_end=True,
                  region='auto',
@@ -97,14 +105,17 @@ class EC2Mode(LaunchMode):
                  aws_key_name=None,
                  iam_instance_profile_name='doodad',
                  swap_size=4096,
+                 tag_exp_name='doodad_experiment',
                  **kwargs):
         super(EC2Mode, self).__init__(**kwargs)
         self.credentials = ec2_credentials
         self.s3_bucket = s3_bucket
         self.s3_log_path = s3_log_path
-        self.s3_log_prefix = s3_log_prefix
+        self.tag_exp_name = tag_exp_name
         self.ami = ami_name
         self.terminate_on_end = terminate_on_end
+        if region == 'auto':
+            region = 'us-west-1'
         self.region = region
         self.instance_type = instance_type
         self.use_gpu = False
@@ -115,14 +126,15 @@ class EC2Mode(LaunchMode):
         self.security_groups = security_groups
         self.security_group_ids = security_group_ids
         self.swap_size = swap_size
-        self.sync_interval = 15
+        self.sync_interval = 60
 
     def dedent(self, s):
         lines = [l.strip() for l in s.split('\n')]
         return '\n'.join(lines)
 
     def run_script(self, script_name, dry=False, return_output=False, verbose=False):
-        assert not return_output
+        if return_output:
+            raise ValueError("Cannot return output for AWS scripts.")
 
         default_config = dict(
             image_id=self.image_id,
@@ -136,25 +148,21 @@ class EC2Mode(LaunchMode):
         )
         aws_config = dict(default_config)
         time_key = gcp_util.make_timekey()
-        exp_name = "{}-{}".format(self.s3_log_prefix, time_key)
-        exp_prefix = self.s3_log_prefix
 
-        s3_base_dir = os.path.join(self.s3_log_path, exp_prefix.replace("_", "-"), exp_name)
-        s3_log_dir = os.path.join(s3_base_dir, 'logs')
+        s3_base_dir = os.path.join('s3://'+self.s3_bucket, self.s3_log_path)
+        s3_log_dir = os.path.join(s3_base_dir, 'outputs')
         stdout_log_s3_path = os.path.join(s3_base_dir, 'stdout_$EC2_INSTANCE_ID.log')
 
         sio = six.StringIO()
         sio.write("#!/bin/bash\n")
-        sio.write("truncate -s 0 /home/ubuntu/user_data.log\n")
+        sio.write("truncate -s 0 /tmp/user_data.log\n")
         sio.write("{\n")
+        sio.write("echo hello!\n")
         sio.write('die() { status=$1; shift; echo "FATAL: $*"; exit $status; }\n')
         sio.write('EC2_INSTANCE_ID="`wget -q -O - http://169.254.169.254/latest/meta-data/instance-id`"\n')
         sio.write("""
             aws ec2 create-tags --resources $EC2_INSTANCE_ID --tags Key=Name,Value={exp_name} --region {aws_region}
-        """.format(exp_name=exp_name, aws_region=self.region))
-        sio.write("""
-            aws ec2 create-tags --resources $EC2_INSTANCE_ID --tags Key=exp_prefix,Value={exp_prefix} --region {aws_region}
-        """.format(exp_prefix=exp_prefix, aws_region=self.region))
+        """.format(exp_name=self.tag_exp_name, aws_region=self.region))
 
         # Add swap file
         if self.use_gpu:
@@ -178,12 +186,20 @@ class EC2Mode(LaunchMode):
         """)
 
         # 1) Upload script and download it to remote
-        aws_util.s3_upload(script_name, self.s3_bucket, 'doodad/mount', dry=dry)
+        cmd_split = shlex.split(script_name)
+        script_fname = cmd_split[0]
+        script_split = os.path.split(script_fname)[-1]
+        if len(cmd_split) > 1:
+            script_args = ' '.join(cmd_split[1:])
+        else:
+            script_args = ''
+        aws_util.s3_upload(script_fname, self.s3_bucket, os.path.join('doodad/mount', script_split), dry=dry)
         script_s3_filename = 's3://{bucket_name}/doodad/mount/{script_name}'.format(
             bucket_name=self.s3_bucket,
-            script_name=script_name
+            script_name=script_split
         )
-        sio.write('aws s3 cp {script_s3_filename} /tmp/remote_script.sh\n'.format(
+        sio.write('aws s3 cp --region {region} {script_s3_filename} /tmp/remote_script.sh\n'.format(
+            region=self.region,
             script_s3_filename=script_s3_filename
         ))
 
@@ -198,15 +214,19 @@ class EC2Mode(LaunchMode):
         ec2_local_dir = '/doodad'
 
         # Sync interval
+        # aws s3 sync --exclude '*' {include_string} {log_dir} {s3_path}
         sio.write("""
         while /bin/true; do
-            aws s3 sync --exclude '*' {include_string} {log_dir} {s3_path}
+            aws s3 cp --recursive --region {region} {log_dir} {s3_path}
             sleep {periodic_sync_interval}
         done & echo sync initiated
         """.format(
-            include_string='',
-            log_dir=ec2_local_dir,
+            #include_string='',
             s3_path=s3_log_dir,
+            #periodic_sync_interval=self.sync_interval
+            log_dir=ec2_local_dir,
+            region=self.region,
+            #s3_path=stdout_log_s3_path,
             periodic_sync_interval=self.sync_interval
         ))
 
@@ -221,8 +241,8 @@ class EC2Mode(LaunchMode):
                 if [ -z $(curl -Is http://169.254.169.254/latest/meta-data/spot/termination-time | head -1 | grep 404 | cut -d \  -f 2) ]
                 then
                     logger "Running shutdown hook."
-                    aws s3 cp --recursive {log_dir} {s3_path}
-                    aws s3 cp /home/ubuntu/user_data.log {stdout_log_s3_path}
+                    aws s3 cp --region {region} --recursive {log_dir} {s3_path}
+                    aws s3 cp --region {region} /tmp/user_data.log {stdout_log_s3_path}
                     break
                 else
                     # Spot instance not yet marked for termination.
@@ -233,6 +253,7 @@ class EC2Mode(LaunchMode):
                 fi
             done & echo log sync initiated
         """.format(
+            region=self.region,
             log_dir=ec2_local_dir,
             s3_path=s3_log_dir,
             stdout_log_s3_path=stdout_log_s3_path,
@@ -240,39 +261,40 @@ class EC2Mode(LaunchMode):
 
         sio.write("""
         while /bin/true; do
-            aws s3 cp /home/ubuntu/user_data.log {stdout_log_s3_path}
+            aws s3 cp --region {region} /tmp/user_data.log {stdout_log_s3_path}
             sleep {periodic_sync_interval}
         done & echo sync initiated
         """.format(
+            region=self.region,
             stdout_log_s3_path=stdout_log_s3_path,
             periodic_sync_interval=self.sync_interval
         ))
 
         if self.use_gpu:
-            sio.write("""
-                for i in {1..800}; do su -c "nvidia-modprobe -u -c=0" ubuntu && break || sleep 3; done
-                systemctl start nvidia-docker
-            """)
+            #sio.write("""
+            #    for i in {1..800}; do su -c "nvidia-modprobe -u -c=0" ec2-user && break || sleep 3; done
+            #    systemctl start nvidia-docker
+            #""")
             sio.write("echo 'Testing nvidia-smi'\n")
             sio.write("nvidia-smi\n")
             sio.write("echo 'Testing nvidia-smi inside docker'\n")
-            #sio.write("nvidia-docker run --rm {docker_image} nvidia-smi\n".format(docker_image=self.docker_image))
+            sio.write("nvidia-docker run --rm {docker_image} nvidia-smi\n".format(docker_image=self.docker_image))
 
-        #docker_cmd = self.get_docker_cmd(main_cmd, use_tty=False, extra_args=mnt_args, pythonpath=py_path, use_docker_generated_name=True)
-
-        docker_cmd = '%s /tmp/remote_script.sh' % self.shell_interpreter
+        docker_cmd = '%s /tmp/remote_script.sh %s' % (self.shell_interpreter, script_args)
         sio.write(docker_cmd+'\n')
 
         # Sync all output mounts to s3 after running the user script
         # Ideally the earlier while loop would be sufficient, but it might be
         # the case that the earlier while loop isn't fast enough to catch a
         # termination. So, we explicitly sync on termination.
-        sio.write("aws s3 cp --recursive {local_dir} {s3_dir}\n".format(
+        sio.write("aws s3 cp --region {region} --recursive {local_dir} {s3_dir}\n".format(
+            region=self.region,
             local_dir=ec2_local_dir,
             s3_dir=s3_log_dir
         ))
-        sio.write("aws s3 cp /home/ubuntu/user_data.log {}\n".format(
-            stdout_log_s3_path,
+        sio.write("aws s3 cp --region {region} /tmp/user_data.log {s3_dir}\n".format(
+            region=self.region,
+            s3_dir=stdout_log_s3_path,
         ))
 
         if self.terminate_on_end:
@@ -280,7 +302,7 @@ class EC2Mode(LaunchMode):
                 EC2_INSTANCE_ID="`wget -q -O - http://169.254.169.254/latest/meta-data/instance-id || die \"wget instance-id has failed: $?\"`"
                 aws ec2 terminate-instances --instance-ids $EC2_INSTANCE_ID --region {aws_region}
             """.format(aws_region=self.region))
-        sio.write("} >> /home/ubuntu/user_data.log 2>&1\n")
+        sio.write("} >> /tmp/user_data.log 2>&1\n")
 
         full_script = self.dedent(sio.getvalue())
         ec2 = boto3.client(
@@ -290,24 +312,7 @@ class EC2Mode(LaunchMode):
             aws_secret_access_key=self.credentials.aws_secret_key,
         )
 
-        if len(full_script) > 10000 or len(base64.b64encode(full_script.encode()).decode("utf-8")) > 10000:
-            s3_path = aws_util.s3_upload(full_script, self.s3_bucket, 'doodad/mount', dry=dry)
-            sio = six.StringIO()
-            sio.write("#!/bin/bash\n")
-            sio.write("""
-            aws s3 cp {s3_path} /home/ubuntu/remote_script.sh --region {aws_region} && \\
-            chmod +x /home/ubuntu/remote_script.sh && \\
-            bash /home/ubuntu/remote_script.sh
-            """.format(s3_path=s3_path, aws_region=self.s3_bucket))
-            user_data = self.dedent(sio.getvalue())
-        else:
-            user_data = full_script
-
-        if verbose:
-            print(full_script)
-            with open("/tmp/full_ec2_script", "w") as f:
-                f.write(full_script)
-
+        user_data = full_script
         instance_args = dict(
             ImageId=aws_config["image_id"],
             KeyName=aws_config["key_name"],
@@ -332,7 +337,7 @@ class EC2Mode(LaunchMode):
             DryRun=dry,
             InstanceCount=1,
             LaunchSpecification=instance_args,
-            SpotPrice=aws_config["spot_price"],
+            SpotPrice=str(aws_config["spot_price"]),
             # ClientToken=params_list[0]["exp_name"],
         )
 
@@ -350,7 +355,7 @@ class EC2Mode(LaunchMode):
                     ec2.create_tags(
                         Resources=[spot_request_id],
                         Tags=[
-                            {'Key': 'Name', 'Value': exp_name}
+                            {'Key': 'Name', 'Value': self.tag_exp_name}
                         ],
                     )
                     break
@@ -363,7 +368,7 @@ class EC2Autoconfig(EC2Mode):
             autoconfig_file=None,
             region='us-west-1',
             s3_bucket=None,
-            ami_image=None,
+            ami_name=None,
             aws_key_name=None,
             iam_instance_profile_name=None,
             **kwargs
@@ -371,7 +376,7 @@ class EC2Autoconfig(EC2Mode):
         # find config file
         autoconfig = Autoconfig(autoconfig_file)
         s3_bucket = autoconfig.s3_bucket() if s3_bucket is None else s3_bucket
-        image_id = autoconfig.aws_image_id(region) if ami_image is None else ami_image
+        image_id = autoconfig.aws_image_id(region) if ami_name is None else ami_name
         aws_key_name= autoconfig.aws_key_name(region) if aws_key_name is None else aws_key_name
         iam_profile= autoconfig.iam_profile_name() if iam_instance_profile_name is None else iam_instance_profile_name
         credentials=AWSCredentials(aws_key=autoconfig.aws_access_key(), aws_secret=autoconfig.aws_access_secret())
@@ -761,6 +766,8 @@ class GCPMode(LaunchMode):
         preemptible (bool): Start a preemptible instance
         zone (str): GCE compute zone.
         instance_type (str): GCE instance type
+        gpu_model (str): GCP GPU model. See https://cloud.google.com/compute/docs/gpus.
+        data_sync_interval (int): Number of seconds before each sync on mounts.
     """
     def __init__(self,
                  gcp_project,
@@ -774,6 +781,9 @@ class GCPMode(LaunchMode):
                  zone='auto',
                  instance_type='f1-micro',
                  gcp_label='gcp_doodad',
+                 num_gpu=1,
+                 gpu_model='nvidia-tesla-t4',
+                 data_sync_interval=15,
                  **kwargs):
         super(GCPMode, self).__init__(**kwargs)
         self.gcp_project = gcp_project
@@ -786,9 +796,14 @@ class GCPMode(LaunchMode):
         self.preemptible = preemptible
         self.zone = zone
         self.instance_type = instance_type
-        self.use_gpu = False
         self.gcp_label = gcp_label
-        self.compute = googleapiclient.discovery.build('compute', 'v1')
+        self.data_sync_interval = data_sync_interval
+        self.compute = googleapiclient.discovery.build('compute', 'v1', cache_discovery=False)
+
+        if self.use_gpu:
+            self.num_gpu = num_gpu
+            self.gpu_model = gpu_model
+            self.gpu_type = gcp_util.get_gpu_type(self.gcp_project, self.zone, self.gpu_model)
 
     def __str__(self):
         return 'GCP-%s-%s' % (self.gcp_project, self.instance_type)
@@ -798,7 +813,7 @@ class GCPMode(LaunchMode):
 
     def run_script(self, script, dry=False, return_output=False, verbose=False):
         if return_output:
-            raise NotImplementedError()
+            raise ValueError("Cannot return output for GCP scripts.")
 
         # Upload script to GCS
         cmd_split = shlex.split(script)
@@ -826,7 +841,8 @@ class GCPMode(LaunchMode):
             'use_gpu': self.use_gpu,
             'script_args': script_args,
             'startup-script': start_script,
-            'shutdown-script': stop_script
+            'shutdown-script': stop_script,
+            'data_sync_interval': self.data_sync_interval
         }
         # instance name must match regex '(?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)'">
         unique_name= "doodad" + str(uuid.uuid4()).replace("-", "")
@@ -887,6 +903,11 @@ class GCPMode(LaunchMode):
                 "exp_prefix": exp_prefix,
             }
         }
+        if self.use_gpu:
+            config["guestAccelerators"] = [{
+                      "acceleratorType": self.gpu_type,
+                      "acceleratorCount": self.num_gpu,
+            }]
         compute_instances = self.compute.instances().insert(
             project=self.gcp_project,
             zone=zone,
@@ -894,3 +915,175 @@ class GCPMode(LaunchMode):
         )
         if not dry:
             return compute_instances.execute()
+
+
+class SlurmScriptMode(LaunchMode):
+    """
+    The "run_script" method in those mode will generate two scripts:
+
+    1. LOCAL_PATH/(generated-script-name)
+    2. LOCAL_PATH/script.sh
+
+    where `script.sh` with contain something like:
+
+    ```
+    sbatch --SBATCH_ARGS --wrap=$'SLURM_PATH/(generated-script) -- cli_args'
+    ```
+
+    You can then easily copy `LOCAL_PATH` to a server and run `script.sh`.
+    For example, you may run the following commands from the server:
+
+    ```
+    $ scp user@my-machine:LOCAL_PATH SLURM_PATH
+    $ cd SLURM_PATH
+    $ ./script.sh
+    ```
+    """
+    def __init__(self,
+                 local_directory_for_scripts,
+                 account_name,
+                 partition,
+                 time_in_mins,
+                 max_num_cores_per_node,
+                 n_gpus=0,
+                 n_cpus_per_task=1,
+                 n_nodes=None,
+                 n_tasks=1,
+                 extra_flags="",
+                 slurm_directory_for_job_script=None,
+                 slurm_script_filename='script.sh',
+                 **kwargs):
+        super(SlurmScriptMode, self).__init__(**kwargs)
+        self.slurm_job_generator = SlurmJobGenerator(
+            account_name=account_name,
+            partition=partition,
+            time_in_mins=time_in_mins,
+            max_num_cores_per_node=max_num_cores_per_node,
+            n_gpus=n_gpus,
+            n_cpus_per_task=n_cpus_per_task,
+            n_nodes=n_nodes,
+            n_tasks=n_tasks,
+            extra_flags=extra_flags,
+        )
+        if slurm_directory_for_job_script is None:
+            slurm_directory_for_job_script = local_directory_for_scripts
+        self.local_directory_for_scripts = local_directory_for_scripts
+        self.slurm_directory_for_job_script = slurm_directory_for_job_script
+        self.slurm_script_file_path = os.path.join(
+            local_directory_for_scripts,
+            slurm_script_filename,
+        )
+
+    def __str__(self):
+        return 'Slurm-Script-%s' % self.local_directory_for_scripts
+
+    def run_script(self, script, dry=False, return_output=False, verbose=False):
+        self.save_job_script(script)
+        self.create_slurm_script(script)
+        return 'Launch script save to: {}'.format(self.slurm_script_file_path)
+
+    def save_job_script(self, script):
+        script_without_cli_args, *cli_args = script.split(' -- ')
+        if len(cli_args) > 1:
+            raise ValueError("Pattern ' -- ' should appear at most once.")
+        shutil.copy(script_without_cli_args, self.local_directory_for_scripts)
+
+    def create_slurm_script(self, script):
+        script_without_cli_args, *cli_args = script.split(' -- ')
+        if len(cli_args) > 1:
+            raise ValueError("Pattern ' -- ' should appear at most once.")
+        new_script_path = (
+                pathlib.Path(self.slurm_directory_for_job_script)
+                / pathlib.Path(script_without_cli_args).name
+        )
+        cmd_with_cli_args = [str(new_script_path)] + cli_args
+        cmd = ' -- '.join(cmd_with_cli_args)
+        full_cmd = self.slurm_job_generator.wrap_command_with_sbatch(cmd)
+        with open(self.slurm_script_file_path, 'w') as f:
+            f.write(full_cmd)
+
+        os.chmod(self.slurm_script_file_path, 0o777)
+        return full_cmd
+
+
+class BrcHighThroughputMode(SlurmScriptMode):
+    """
+    The "run_script" method in those mode will generate two scripts:
+
+    1. LOCAL_PATH/(generated-script-name)
+    2. LOCAL_PATH/script.sh
+    3. LOCAL_PATH/task.sh
+
+    where `script.sh` with contain something like:
+
+    ```
+    sbatch --OTHER_SBATCH_ARGS --wrap=$'module load gcc openmpi;ht_helper.sh -m "python/3.5" -t SLURM_PATH/task.sh'
+
+    ```
+
+    You can then easily copy `LOCAL_PATH` to a server and run `script.sh`.
+    For example, you may run the following commands from the server:
+
+    ```
+    $ scp user@my-machine:LOCAL_PATH SLURM_PATH
+    $ cd SLURM_PATH
+    $ ./script.sh
+    ```
+
+    This mode is specialized to Berkeley Research Computer cluster's High
+    Throughput Mode. The main difference between this mode and the base
+    `SlurmScriptMode` is that all the job inside `task.sh` will run in parallel
+    in the same node.
+
+    For more details, see
+
+    https://docs-research-it.berkeley.edu/services/high-performance-computing/user-guide/running-your-jobs/hthelper-script
+    """
+    def __init__(self,
+                 *args,
+                 task_filename='task.sh',
+                 overwrite_task_script=False,
+                 verbose_task_script_update=True,
+                 **kwargs):
+        super(BrcHighThroughputMode, self).__init__(*args, **kwargs)
+        self.local_task_file_path = os.path.join(
+            self.local_directory_for_scripts,
+            task_filename,
+        )
+        self.slurm_task_file_path = os.path.join(
+            self.slurm_directory_for_job_script,
+            task_filename,
+        )
+        self.overwrite_task_script = overwrite_task_script
+        self.verbose_task_script_update = verbose_task_script_update
+
+    def run_script(self, script, dry=False, return_output=False, verbose=False):
+        self.save_job_script(script)
+        self.create_task_file(script)
+        self.create_slurm_script(script)
+        return 'Launch script save to: {}'.format(self.slurm_script_file_path)
+
+    def create_task_file(self, script):
+        script_without_cli_args, *cli_args = script.split(' -- ')
+        if len(cli_args) > 1:
+            raise ValueError("Pattern ' -- ' should appear at most once.")
+        new_script_path = str(
+                pathlib.Path(self.slurm_directory_for_job_script)
+                / pathlib.Path(script_without_cli_args).name
+        )
+        cmd_with_cli_args = [str(new_script_path)] + cli_args
+        cmd = ' -- '.join(cmd_with_cli_args)
+        script_builder.add_to_script(
+            cmd,
+            path=self.local_task_file_path,
+            verbose=self.verbose_task_script_update,
+            overwrite=self.overwrite_task_script,
+        )
+
+    def create_slurm_script(self, script):
+        cmd_list = cmd_builder.CommandBuilder()
+        cmd_list.append('module load gcc openmpi')
+        cmd_list.append('ht_helper.sh -m "python/3.5" -t {}'.format(
+            self.slurm_task_file_path
+        ))
+        super().create_slurm_script(cmd_list.to_string())

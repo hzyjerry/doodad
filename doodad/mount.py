@@ -20,7 +20,7 @@ class Mount(object):
     """
     Args:
         mount_point (str): Location of directory visible to the running process *inside* container
-        pythonpath (bool): If True, adds this folder to the $PYTHON_PATH environment variable
+        pythonpath (bool): If True, adds this folder to the $PYTHONPATH environment variable
         output (bool): If False, this is a "code" directory. If True, this should be an empty
             "output" directory (nothing will be copied to remote)
     """
@@ -63,13 +63,15 @@ class MountLocal(Mount):
         self.cleanup = cleanup
         self.filter_ext = filter_ext
         self.filter_dir = filter_dir
-        if self.writeable:
-            if not self.mount_point.startswith('/'):
-                raise ValueError('Output mount points must be absolute')
         if mount_point is None:
             self.mount_point = self.local_dir
         else:
-            assert not self.mount_point.endswith('/'), "Do not end mount points with backslash"
+            assert not self.mount_point.endswith('/'), "Do not end mount points with backslash:"+self.mount_point
+        if self.writeable:
+            if not self.mount_point.startswith('/'):
+                raise ValueError('Output mount points must be absolute')
+            if not self.local_dir.startswith('/'):
+                raise ValueError('Output local directories must be absolute')
 
     def ignore_patterns(self, dirname, contents):
         to_ignore = []
@@ -88,13 +90,16 @@ class MountLocal(Mount):
 
         if self.read_only:
             shutil.copytree(self.local_dir, dep_dir, ignore=self.ignore_patterns)
-            with open(extract_file, 'w') as f:
-                f.write('mkdir -p %s\n' % mount_point)
-                f.write('mv ./deps/local/{name} {mount}'.format(name=self.name, mount=self.mount_point))
         else:
             os.makedirs(dep_dir)
-            with open(extract_file, 'w') as f:
+        with open(extract_file, 'w') as f:
+            if self.read_only:
                 f.write('mkdir -p %s\n' % mount_point)
+                f.write('mv ./deps/local/{name} {mount}\n'.format(name=self.name, mount=self.mount_point))
+            else:
+                f.write('mkdir -p %s\n' % mount_point)
+            if self.pythonpath:
+                f.write('export PYTHONPATH=$PYTHONPATH:{repo_dir}\n'.format(repo_dir=mount_point))
         os.chmod(extract_file, 0o777)
 
     def dar_extract_command(self):
@@ -117,6 +122,8 @@ class MountGit(Mount):
         self.repo_name = os.path.splitext(os.path.split(git_url)[1])[0]
         assert self.mount_point.endswith(self.repo_name)
         self.ssh_identity = ssh_identity
+        if ssh_identity is not None:
+            self.ssh_identity = os.path.expanduser(ssh_identity)
         self.branch = branch
         self._name = self.repo_name
 
@@ -130,17 +137,21 @@ class MountGit(Mount):
             f.write('mkdir -p %s\n' % mount_point)
             f.write('pushd %s > /dev/null\n' % mount_point)
             if self.ssh_identity:
-                f.write("GIT_SSH_COMMAND='ssh -i {id}' git clone --quiet {repo_url}\n".format(id=self.ssh_identity, repo_url=self.git_url))
+                shutil.copy(self.ssh_identity, dep_dir)
+                id_file = os.path.split(self.ssh_identity)[1]
+                id_file = os.path.join('/dar_payload/deps/git/{name}'.format(name=self.name), id_file)
+                f.write("GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=no -i {id}' git clone --quiet {repo_url}\n".format(id=id_file, repo_url=self.git_url))
             else:
                 f.write("git clone --quiet {repo_url}\n".format(repo_url=self.git_url))
             if self.branch:
                 f.write('cd {repo_name}\n'.format(repo_name=self.repo_name))
                 f.write('git checkout --quiet {branch}\n'.format(branch=self.branch))
-            f.write('popd > /dev/null')
+            if self.pythonpath:
+                f.write('export PYTHONPATH=$PYTHONPATH:{repo_dir}\n'.format(repo_dir=os.path.join(mount_point, self.repo_name)))
+            f.write('popd > /dev/null\n')
         os.chmod(extract_file, 0o777)
 
     def dar_extract_command(self):
-        # execute the script to pull from S3
         return './deps/git/{name}/extract.sh'.format(
             name=self.name,
         )
@@ -160,7 +171,7 @@ class MountS3(Mount):
             raise NotImplementedError('Local dir cannot be absolute')
         else:
             # We store everything into a fixed dir /doodad on the remote machine
-            # so GCPMode knows to simply sync /doodad
+            # so EC2Mode knows to simply sync /doodad
             # (this is b/c we no longer pass in mounts to the launch mode)
             self.sync_dir = os.path.join('/doodad', s3_path)
         self.output = output
@@ -175,7 +186,7 @@ class MountS3(Mount):
         return
 
     def dar_extract_command(self):
-        return 'echo helloMountEC2'
+        return 'echo helloMountS3'
 
 
 class MountGCP(Mount):
@@ -216,7 +227,6 @@ class MountGCP(Mount):
 
     def dar_extract_command(self):
         return 'echo helloMountGCP'
-
 
 
 class MountAzure(Mount):

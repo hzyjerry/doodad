@@ -5,8 +5,8 @@ from doodad.utils import TESTING_DIR
 from testing.config import S3_BUCKET
 
 def run():
-    ec2_mount = mount.MountEC2(
-        gcp_path='secret_output',
+    ec2_mount = mount.MountS3(
+        s3_path='secret_output',
         mount_point='/output'
     )
     local_mount = mount.MountLocal(
@@ -15,21 +15,27 @@ def run():
         output=False
     )
     mounts = [local_mount, ec2_mount]
-    ec2_credentials
 
     launcher = mode.EC2Autoconfig(
         s3_bucket=S3_BUCKET,
-        s3_log_path='test_doodad/gcp_test',
-        instance_type='t3.nano',
-        spot_price=0.02,
-        region='us-west1',
-        ami_name='ami-089408c670f3e10c0',
+        s3_log_path='test_doodad/ec2_test',
+        instance_type='t3a.micro',
+        spot_price=0.03,
+        region='us-east-2',
+        ami_name='ami-0aa0375ca68b5554d',
     )
 
-    launch_api.run_command(
-        command='cat /data/secret.txt > /output/secret.txt',
+    #launch_api.run_command(
+    #    command='cat /data/secret.txt > /output/secret.txt',
+    #    mode=launcher,
+    #    mounts=mounts,
+    #    verbose=True
+    #)
+
+    launch_api.run_python(
+        target='testing/remote/py_print.py',
+        cli_args='--message=test_args123',
         mode=launcher,
-        mounts=mounts,
         verbose=True
     )
 

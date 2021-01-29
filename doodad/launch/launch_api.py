@@ -22,7 +22,10 @@ def run_command(
         mounts=tuple(),
         return_output=False,
         verbose=False,
-        docker_image='ubuntu:18.04'
+        docker_image='ubuntu:18.04',
+        singularity_image=None,
+        container_type='docker',
+        extra_container_flags='',
     ):
     """
     Runs a shell command using doodad via a specified launch mode.
@@ -34,6 +37,9 @@ def run_command(
         mounts (tuple): A list/tuple of Mount objects
         return_output (bool): If True, returns stdout as a string.
             Do not use if the output will be large.
+        container_type (string): either 'docker' or 'singularity
+        extra_container_flags (string): flags other than GPU flags to pass to
+            docker run or singularity exec.
 
     Returns:
         A string output if return_output is True,
@@ -44,6 +50,10 @@ def run_command(
                                                 payload_script=command,
                                                 verbose=False,
                                                 docker_image=docker_image,
+                                                singularity_image=singularity_image,
+                                                container_type=container_type,
+                                                extra_container_flags=extra_container_flags,
+                                                use_gpu_image=mode.use_gpu,
                                                 mounts=mounts)
         cmd = archive
         if cli_args:

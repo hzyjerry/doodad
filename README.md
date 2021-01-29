@@ -12,7 +12,7 @@ doodad is designed to be as minimally invasive as possible - most code can be ru
 See the [quickstart](https://github.com/justinjfu/doodad/wiki/Quickstart) guide for a quick tutorial.
 
 ## Setup
-- Install Python 2 or Python 3. doodad currently supports both.
+- Install Python 3.6+
 
 - Install [Docker CE](https://docs.docker.com/engine/installation/).
 
@@ -24,11 +24,6 @@ export PYTHONPATH=$PYTHONPATH:/path/to/this/repo
 - Install dependencies
 ```
 pip install -r requirements.txt
-```
-
-- (Optional) Set up EC2
-```
-python scripts/ec2_setup.py
 ```
 
 ## Example

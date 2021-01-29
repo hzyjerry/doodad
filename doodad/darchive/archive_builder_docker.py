@@ -8,6 +8,7 @@ Currently, doodad uses makeself as a backend to build these
 packaged scripts.
 """
 import os
+import pathlib
 import sys
 import tempfile
 import shutil
@@ -25,11 +26,16 @@ MAKESELF_PATH = os.path.join(THIS_FILE_DIR, 'makeself.sh')
 MAKESELF_HEADER_PATH = os.path.join(THIS_FILE_DIR, 'makeself-header.sh')
 BEGIN_HEADER = '--- BEGIN DAR OUTPUT ---'
 DAR_PAYLOAD_MOUNT = 'dar_payload'
+FINAL_SCRIPT = './final_script.sh'
 
 def build_archive(archive_filename='runfile.dar',
                   docker_image='ubuntu:18.04',
+                  singularity_image=None,
+                  container_type='docker',
+                  extra_container_flags='',
                   payload_script='',
                   mounts=(),
+                  use_gpu_image=False,
                   verbose=False):
     """
     Construct a Doodad Archive
@@ -44,6 +50,12 @@ def build_archive(archive_filename='runfile.dar',
     Returns:
         str: Name of archive file.
     """
+    if container_type not in {'singularity', 'docker'}:
+        raise ValueError("Unknown container type: {}. Valid container types: "
+                         "'singularity', 'docker'")
+    if container_type == 'singularity' and singularity_image is None:
+        raise ValueError("singularity_image must be set.")
+
     # create a temporary work directory
     try:
         work_dir = tempfile.mkdtemp()
@@ -57,12 +69,31 @@ def build_archive(archive_filename='runfile.dar',
 
         write_run_script(archive_dir, mounts,
             payload_script=payload_script, verbose=verbose)
-        write_docker_hook(archive_dir, docker_image, mounts, verbose=verbose)
+        # write_docker_hook(archive_dir, docker_image, mounts, verbose=verbose)
+        # write_metadata(archive_dir)
+
+        # # create the self-extracting archive
+        # # import pdb; pdb.set_trace()
+        # compile_archive(archive_dir, archive_filename, verbose=verbose)
+        if container_type == 'singularity':
+            write_singularity_hook(archive_dir, singularity_image, mounts,
+                                   extra_flags=extra_container_flags,
+                                   script_name=FINAL_SCRIPT,
+                                   verbose=verbose,
+                                   use_nvidia_docker=use_gpu_image)
+        elif container_type == 'docker':
+            write_docker_hook(archive_dir, docker_image, mounts,
+                              extra_flags=extra_container_flags,
+                              script_name=FINAL_SCRIPT,
+                              verbose=verbose,
+                              use_nvidia_docker=use_gpu_image)
+        else:
+            raise NotImplementedError()
         write_metadata(archive_dir)
 
         # create the self-extracting archive
-        # import pdb; pdb.set_trace()
-        compile_archive(archive_dir, archive_filename, verbose=verbose)
+        compile_archive(archive_dir, archive_filename, FINAL_SCRIPT,
+                        verbose=verbose)
     finally:
         shutil.rmtree(work_dir)
     return archive_filename
@@ -73,8 +104,11 @@ def write_metadata(arch_dir):
         f.write('unix_timestamp=%d\n' % time.time())
         f.write('uuid=%s\n' % uuid.uuid4())
 
-def write_docker_hook(arch_dir, image_name, mounts, verbose=False):
-    docker_hook_file = os.path.join(arch_dir, 'docker.sh')
+def write_docker_hook(
+        arch_dir, image_name, mounts, script_name,
+        extra_flags='',
+        verbose=False, use_nvidia_docker=False):
+    docker_hook_file = os.path.join(arch_dir, script_name)
     builder = cmd_builder.CommandBuilder()
     builder.append('#!/bin/bash')
     #if verbose:
@@ -84,8 +118,10 @@ def write_docker_hook(arch_dir, image_name, mounts, verbose=False):
         for mnt in mounts if mnt.writeable])
     # mount the script into the docker image
     mnt_cmd += ' -v $(pwd):/'+DAR_PAYLOAD_MOUNT
-    docker_cmd = ('docker run {mount_cmds} -t {img} /bin/bash -c "cd /{dar_payload};./run.sh $*"'.format(
+    docker_cmd = ('docker run {gpu_opt} {mount_cmds} {extra_flags} -t {img} /bin/bash -c "cd /{dar_payload};./run.sh $*"'.format(
+        gpu_opt='--gpus all' if use_nvidia_docker else '',
         img=image_name,
+        extra_flags=extra_flags,
         mount_cmds=mnt_cmd,
         dar_payload=DAR_PAYLOAD_MOUNT
     ))
@@ -96,6 +132,38 @@ def write_docker_hook(arch_dir, image_name, mounts, verbose=False):
     with open(docker_hook_file, 'w') as f:
         f.write(builder.dump_script())
     os.chmod(docker_hook_file, 0o777)
+
+def write_singularity_hook(arch_dir, image_name, mounts,
+                           script_name,
+                           extra_flags='',
+                           verbose=False, use_nvidia_docker=False):
+    singularity_hook_file = os.path.join(arch_dir, script_name)
+    builder = cmd_builder.CommandBuilder()
+    builder.append('#!/bin/bash')
+    mnt_cmd = ' '.join(['--bind %s:%s' % (mnt.sync_dir, mnt.mount_point)
+                       for mnt in mounts if mnt.writeable])
+    tmp_dir = tempfile.mkdtemp()
+    def create_bind_flag(mnt):
+        parent_directory = pathlib.Path(mnt.mount_point).parent
+        return '--bind %s:%s' % (tmp_dir, parent_directory)
+    mnt_cmd += ' ' + ' '.join([create_bind_flag(mnt)
+                               for mnt in mounts if not mnt.writeable])
+    mnt_cmd += ' --bind $(pwd):/'+DAR_PAYLOAD_MOUNT
+    singularity_cmd = ('mkdir {tmp_dir}; singularity exec {extra_flags} {gpu_opt} {mount_cmds} {img} /bin/bash -c "cd /{dar_payload}; ./run.sh $*"'.format(
+        tmp_dir=tmp_dir,
+        gpu_opt='--nv' if use_nvidia_docker else '',
+        img=image_name,
+        extra_flags=extra_flags,
+        mount_cmds=mnt_cmd,
+        dar_payload=DAR_PAYLOAD_MOUNT
+    ))
+    if verbose:
+        builder.echo('Singularity command:' + singularity_cmd)
+    builder.append(singularity_cmd)
+
+    with open(singularity_hook_file, 'w') as f:
+        f.write(builder.dump_script())
+    os.chmod(singularity_hook_file, 0o777)
 
 def write_run_script(arch_dir, mounts, payload_script, verbose=False):
     runfile = os.path.join(arch_dir, 'run.sh')
@@ -122,15 +190,15 @@ def write_run_script(arch_dir, mounts, payload_script, verbose=False):
 
     os.chmod(runfile, 0o777)
 
-def compile_archive(archive_dir, output_file, verbose=False):
-    compile_cmd = "{mkspath} --nocrc --nomd5  --nocomp --header {mkhpath} {archive_dir} {output_file} {name} {run_script}"
+def compile_archive(archive_dir, output_file, script_name, verbose=False):
+    compile_cmd = "{mkspath} --nocrc --nomd5 --header {mkhpath} {archive_dir} {output_file} {name} {run_script}"
     compile_cmd = compile_cmd.format(
         mkspath=MAKESELF_PATH,
         mkhpath=MAKESELF_HEADER_PATH,
         name='DAR',
         archive_dir=archive_dir,
         output_file=output_file,
-        run_script='./docker.sh'
+        run_script=script_name,
     )
     # pipe = subprocess.PIPE
     # p = subprocess.Popen(compile_cmd, shell=True, stdout=pipe, stderr=pipe)
@@ -168,4 +236,3 @@ def temp_archive_file():
         yield archive_file
     finally:
         shutil.rmtree(work_dir)
-
