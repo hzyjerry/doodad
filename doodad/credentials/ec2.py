@@ -15,10 +15,10 @@ class AWSCredentials(object):
         env_key (str, optional): Environment variable for AWS key. Default AWS_ACCESS_KEY.
         env_secret_key (str, optional): Environment variable for AWS secret key. Default AWS_ACCESS_SECRET.
         from_config (bool): If True, reads key from config file
-        config_filename (str, optional): 
+        config_filename (str, optional):
     """
-    def __init__(self, aws_key=None, aws_secret=None, 
-            from_env=False, 
+    def __init__(self, aws_key=None, aws_secret=None,
+            from_env=False,
             from_config=False,
             config_filename='~/.aws/credentials',
             env_secret_key='AWS_ACCESS_SECRET',

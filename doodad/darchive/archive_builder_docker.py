@@ -26,7 +26,7 @@ MAKESELF_HEADER_PATH = os.path.join(THIS_FILE_DIR, 'makeself-header.sh')
 BEGIN_HEADER = '--- BEGIN DAR OUTPUT ---'
 DAR_PAYLOAD_MOUNT = 'dar_payload'
 
-def build_archive(archive_filename='runfile.dar', 
+def build_archive(archive_filename='runfile.dar',
                   docker_image='ubuntu:18.04',
                   payload_script='',
                   mounts=(),
@@ -37,10 +37,10 @@ def build_archive(archive_filename='runfile.dar',
     Args:
         archive_filename (str): Name of file to save constructed archive script
         docker_image (str): Name of docker image
-        payload_script (str): A command or sequence of shell commands to be 
+        payload_script (str): A command or sequence of shell commands to be
             executed inside the container on when the script is run.
         mounts (tuple): A list of Mount objects
-    
+
     Returns:
         str: Name of archive file.
     """
@@ -54,13 +54,14 @@ def build_archive(archive_filename='runfile.dar',
         os.makedirs(deps_dir)
         for mnt in mounts:
             mnt.dar_build_archive(deps_dir)
-        
-        write_run_script(archive_dir, mounts, 
-            payload_script=payload_script, verbose=verbose) 
+
+        write_run_script(archive_dir, mounts,
+            payload_script=payload_script, verbose=verbose)
         write_docker_hook(archive_dir, docker_image, mounts, verbose=verbose)
         write_metadata(archive_dir)
 
         # create the self-extracting archive
+        # import pdb; pdb.set_trace()
         compile_archive(archive_dir, archive_filename, verbose=verbose)
     finally:
         shutil.rmtree(work_dir)
@@ -79,7 +80,7 @@ def write_docker_hook(arch_dir, image_name, mounts, verbose=False):
     #if verbose:
     #    builder.echo('All script arguments:')
     #    builder.echo('$@')
-    mnt_cmd = ''.join([' -v %s:%s' % (mnt.sync_dir, mnt.mount_point) 
+    mnt_cmd = ''.join([' -v %s:%s' % (mnt.sync_dir, mnt.mount_point)
         for mnt in mounts if mnt.writeable])
     # mount the script into the docker image
     mnt_cmd += ' -v $(pwd):/'+DAR_PAYLOAD_MOUNT
@@ -122,7 +123,7 @@ def write_run_script(arch_dir, mounts, payload_script, verbose=False):
     os.chmod(runfile, 0o777)
 
 def compile_archive(archive_dir, output_file, verbose=False):
-    compile_cmd = "{mkspath} --nocrc --nomd5 --header {mkhpath} {archive_dir} {output_file} {name} {run_script}"
+    compile_cmd = "{mkspath} --nocrc --nomd5  --nocomp --header {mkhpath} {archive_dir} {output_file} {name} {run_script}"
     compile_cmd = compile_cmd.format(
         mkspath=MAKESELF_PATH,
         mkhpath=MAKESELF_HEADER_PATH,
@@ -131,10 +132,12 @@ def compile_archive(archive_dir, output_file, verbose=False):
         output_file=output_file,
         run_script='./docker.sh'
     )
-    pipe = subprocess.PIPE
-    p = subprocess.Popen(compile_cmd, shell=True, stdout=pipe, stderr=pipe)
-    p.wait()
-    p.communicate()
+    # pipe = subprocess.PIPE
+    # p = subprocess.Popen(compile_cmd, shell=True, stdout=pipe, stderr=pipe)
+    # p = subprocess.Popen(compile_cmd, shell=True, stdout=subprocess.STDOUT, stderr=subprocess.STDOUT)
+    # p.wait()
+    # p.communicate()
+    os.system(compile_cmd)
     os.chmod(output_file, 0o777)
 
 def run_archive(filename, cli_args='', encoding='utf-8', shell_interpreter='sh', timeout=None, get_output=True):
@@ -151,7 +154,7 @@ def run_archive(filename, cli_args='', encoding='utf-8', shell_interpreter='sh',
 
 
 def _strip_stdout(output):
-    begin_output = output.find(BEGIN_HEADER, 0) 
+    begin_output = output.find(BEGIN_HEADER, 0)
     if begin_output >= 0:
         begin_output += len(BEGIN_HEADER)
     output = output[begin_output+1:]

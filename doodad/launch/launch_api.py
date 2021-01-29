@@ -34,7 +34,7 @@ def run_command(
         mounts (tuple): A list/tuple of Mount objects
         return_output (bool): If True, returns stdout as a string.
             Do not use if the output will be large.
-    
+
     Returns:
         A string output if return_output is True,
         else None
@@ -42,7 +42,7 @@ def run_command(
     with archive_builder.temp_archive_file() as archive_file:
         archive = archive_builder.build_archive(archive_filename=archive_file,
                                                 payload_script=command,
-                                                verbose=False, 
+                                                verbose=False,
                                                 docker_image=docker_image,
                                                 mounts=mounts)
         cmd = archive

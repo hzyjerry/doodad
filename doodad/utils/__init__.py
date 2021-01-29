@@ -9,7 +9,7 @@ TESTING_DIR = os.path.join(REPO_DIR, 'testing')
 TESTING_OUTPUT_DIR = os.path.join(TESTING_DIR, 'test_outputs')
 SCRIPTS_DIR = os.path.join(REPO_DIR, 'scripts')
 
-HASH_BUF_SIZE = 65536 
+HASH_BUF_SIZE = 65536
 
 def hash_file(filename):
     hasher = hashlib.md5()

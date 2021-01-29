@@ -13,7 +13,7 @@ class FailedImportModule(object):
     def __init__(self, name):
         self.module_name = name
         self.submodules = {}
-    
+
     def __getattr__(self, key):
         if key in self.submodules:
             return self.submodules[key]
@@ -24,7 +24,7 @@ class FailedImportModule(object):
             self.submodules[key] = value
         else:
             super(FailedImportModule, self).__setattr__(key, value)
-        
+
 
 def try_import(name):
     """
@@ -52,4 +52,4 @@ def try_import(name):
         return importlib.import_module(name)
     except ImportError:
         return FailedImportModule(name)
-    
+

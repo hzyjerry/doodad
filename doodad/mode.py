@@ -2,6 +2,7 @@ import os
 import json
 import uuid
 import six
+import time
 import base64
 import pprint
 import shlex
@@ -9,6 +10,7 @@ import shlex
 from doodad.utils import shell
 from doodad.utils import safe_import
 from doodad import mount
+from doodad.apis import azure_util
 from doodad.apis.ec2.autoconfig import Autoconfig
 from doodad.credentials.ec2 import AWSCredentials
 
@@ -25,7 +27,7 @@ class LaunchMode(object):
 
     Args:
         shell_interpreter (str): Interpreter command for script. Default 'sh'
-        async_run (bool): If True, 
+        async_run (bool): If True,
     """
     def __init__(self, shell_interpreter='sh', async_run=False):
         self.shell_interpreter = shell_interpreter
@@ -75,12 +77,12 @@ class SSHMode(LaunchMode):
         self.ssh_cred = ssh_credentials
 
     def _get_run_command(self, script_filename):
-        return self.ssh_cred.get_ssh_script_cmd(script_filename, 
+        return self.ssh_cred.get_ssh_script_cmd(script_filename,
                                                 shell_interpreter=self.shell_interpreter)
 
 
 class EC2Mode(LaunchMode):
-    def __init__(self, 
+    def __init__(self,
                  ec2_credentials,
                  s3_bucket,
                  s3_log_path,
@@ -114,7 +116,7 @@ class EC2Mode(LaunchMode):
         self.security_group_ids = security_group_ids
         self.swap_size = swap_size
         self.sync_interval = 15
-    
+
     def dedent(self, s):
         lines = [l.strip() for l in s.split('\n')]
         return '\n'.join(lines)
@@ -185,7 +187,7 @@ class EC2Mode(LaunchMode):
             script_s3_filename=script_s3_filename
         ))
 
-        # 2) Sync data 
+        # 2) Sync data
         # In theory the ec2_local_dir could be some random directory,
         # but we make it the same as the mount directory for
         # convenience.
@@ -388,6 +390,359 @@ class EC2Autoconfig(EC2Mode):
                 **kwargs
                 )
 
+class AzureMode(LaunchMode):
+    """
+    Azure Launch Mode.
+
+    Args:
+        azure_storage (str): Azure Bucket for storing logs and data
+        azure_group_name (str): Name of the azure project.
+        disk_size (int): Amount of disk to allocate to instance in Gb.
+        terminate_on_end (bool): Terminate instance when script finishes
+        preemptible (bool): Start a preemptible instance
+        zone (str): Azure compute zone.
+        instance_type (str): Azure instance type
+
+    Deprecated:
+        azure_log_path (str): Path under Azure bucket to store logs/data.
+            The full path will be of the form:
+            https://{azure_storage}.blob.core.windows.net/{azure_log_path}
+
+    Example:
+        azure_group_name: 'jerry-assisted-reward-design'
+    """
+
+    def __init__(self,
+                 azure_storage,
+                 azure_group_name='ubuntu-os-cloud',
+                 #azure_image='ubuntu-1804-bionic-v20181222',
+                 disk_size=64,
+                 terminate_on_end=True,
+                 instance_type='f1-micro',
+                 azure_label='azure_doodad',
+                 # storage_data_path='doodad-data',
+                 # storage_logs_path='doodad-logs',
+                 gcp_bucket_name="",
+                 gcp_bucket_path="",
+                 gcp_auth_file="",
+                 location='eastus',
+                 username='doodad',
+                 password='doodad@123',
+                 **kwargs):
+        from azure.identity import DefaultAzureCredential
+
+        super(AzureMode, self).__init__(**kwargs)
+        self.azure_storage = azure_storage
+        # self.azure_image = azure_image
+        self.azure_group_name = azure_group_name
+        self.disk_size = disk_size
+        self.terminate_on_end = terminate_on_end
+        self.use_gpu = False
+        self.azure_label = azure_label
+        # self.storage_data_path = storage_data_path
+        # self.storage_logs_path = storage_logs_path
+        self.gcp_bucket_path = gcp_bucket_path
+        self.gcp_bucket_name = gcp_bucket_name
+        self.gcp_auth_file = gcp_auth_file
+        self.location = location
+        self.username = username
+        self.password = password
+        # instance name must match regex '(?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)'">
+        self.unique_name= "doodad" + str(uuid.uuid4()).replace("-", "")
+
+        ## Credentials
+        self.subscription_id = os.environ.get("AZURE_SUBSCRIPTION_ID", "<subscription_id>")
+        self.cred_wrapper = azure_util.CredentialWrapper()
+        self.credentials = DefaultAzureCredential()
+
+        self.vm_reference = {
+            'linux': {
+                'publisher': 'Canonical',
+                'offer': 'UbuntuServer',
+                'sku': '16.04.0-LTS',
+                'version': 'latest'
+            }
+        }
+
+    def __str__(self):
+        return 'Azure-%s' % (self.azure_group_name)
+
+    def print_launch_message(self):
+        pass
+
+    def run_script(self, script, dry=False, return_output=False, verbose=False, wait=False):
+        if return_output:
+            raise NotImplementedError()
+
+        print("Creating network")
+        t1 = time.time()
+        nic_id = self.create_network()
+        print("Created network", time.time() - t1)
+
+        # Upload script to GCS
+        cmd_split = shlex.split(script)
+        script_fname = cmd_split[0]
+        if len(cmd_split) > 1:
+            script_args = ' '.join(cmd_split[1:])
+        else:
+            script_args = ''
+        # remote_script = azure_util.upload_file_to_azure_storage(
+        #     credentials=self.credentials,
+        #     #subscription_id=self.subscription_id,
+        #     group_name=self.azure_group_name,
+        #     #storage_name=self.azure_storage,
+        #     location=self.location,
+        #     file_name=script_fname,
+        #     dry=dry)
+        remote_script_path = gcp_util.upload_file_to_gcp_storage(self.gcp_bucket_name, script_fname, dry=dry)
+
+        exp_name = "{}-{}".format(self.azure_label, azure_util.make_timekey())
+        exp_prefix = self.azure_label
+
+        with open(azure_util.AZURE_STARTUP_SCRIPT_PATH) as f:
+            start_script = self.process_script(f.read(), script_args, remote_script_path=remote_script_path)
+        with open(azure_util.AZURE_SHUTDOWN_SCRIPT_PATH) as f:
+            stop_script = self.process_script(f.read())
+
+        print("Creating msi")
+        t1 = time.time()
+        msi_identity = self.create_msi()
+        print("Created msi", time.time() - t1)
+
+        vm_parameters = {
+            'location': self.location,
+            'os_profile': {
+                'computer_name': self.unique_name,
+                'admin_username': self.username,
+                'admin_password': self.password,
+                'custom_data': start_script,
+            },
+            'hardware_profile': {
+                #'vm_size': 'Standard_DS1'
+                'vm_size': 'STANDARD_D4_V3'
+            },
+            'storage_profile': {
+                'image_reference': {
+                    'publisher': self.vm_reference['linux']['publisher'],
+                    'offer': self.vm_reference['linux']['offer'],
+                    'sku': self.vm_reference['linux']['sku'],
+                    'version': self.vm_reference['linux']['version']
+                },
+                # 'os_disk': {
+                #     'name': unique_name + '-osdisk',
+                #     'caching': 'None',
+                #     'create_option': 'Empty',
+                #     # 'create_option': 'fromImage',
+                #     # 'vhd': {
+                #     #     'uri': 'https://jerryassisted.blob.core.windows.net/vhds/jerry-assisted-reward-designsoft-paper-2857.vhd'
+                #     #     # 'uri': 'https://{}.blob.core.windows.net/vhds/{}.vhd'.format(
+                #     #     #     self.azure_storage, unique_name+haikunator.haikunate())
+                #     # }
+                # },
+            },
+            'network_profile': {
+                'network_interfaces': [{
+                    'id': nic_id,
+                }]
+            },
+            'identity': msi_identity
+        }
+        print("Creating vm")
+        t1 = time.time()
+        vm_result = self.create_instance(vm_parameters, self.unique_name, exp_name, exp_prefix, dry=dry, wait=wait)
+        print("Created vm", time.time() - t1)
+
+        if verbose:
+            print('Launched instance %s' % self.unique_name)
+        return vm_result
+
+    def create_msi(self):
+        '''Assign Azure identity'''
+        ### Enable MSI
+        from azure.mgmt.msi import ManagedServiceIdentityClient
+        from azure.mgmt.compute.models import ResourceIdentityType
+
+        params_identity = {'principal_id': []}
+        msi_client = ManagedServiceIdentityClient(self.cred_wrapper, self.subscription_id)
+        if azure_util.USER_ASSIGNED_IDENTITY:
+            # Create a User Assigned Identity if needed
+            print("\nCreate User Assigned Identity")
+            user_assigned_identity = msi_client.user_assigned_identities.create_or_update(
+                self.azure_group_name,
+                "myMsiIdentity",  # Any name, just a human readable ID
+                self.location
+            )
+            params_identity['principal_id'].append(user_assigned_identity.principal_id)
+            azure_util.print_item(user_assigned_identity)
+        if azure_util.USER_ASSIGNED_IDENTITY and azure_util.SYSTEM_ASSIGNED_IDENTITY:
+            params_identity['type'] = ResourceIdentityType.system_assigned_user_assigned
+            params_identity['user_assigned_identities'] = {
+                user_assigned_identity.id: {}
+            }
+        elif azure_util.USER_ASSIGNED_IDENTITY:  # User Assigned only
+            params_identity['type'] = ResourceIdentityType.user_assigned
+            params_identity['user_assigned_identities'] = {
+                user_assigned_identity.id: {}
+            }
+        elif azure_util.SYSTEM_ASSIGNED_IDENTITY:  # System assigned only
+            params_identity['type'] = ResourceIdentityType.system_assigned
+        return params_identity
+
+    def process_script(self, raw_script, script_args='', remote_script_path=''):
+        start_script = raw_script.replace("{exp_name}", "123")
+        start_script = start_script.replace("{storage_name}", self.azure_storage)
+        # start_script = start_script.replace("{storage_logs_path}", self.storage_logs_path)
+        # start_script = start_script.replace("{storage_data_path}", self.storage_data_path)
+        start_script = start_script.replace("{shell_interpreter}", self.shell_interpreter)
+        start_script = start_script.replace("{remote_script_path}", remote_script_path)
+        start_script = start_script.replace("{gcp_bucket_path}", self.gcp_bucket_path)
+        start_script = start_script.replace("{gcp_bucket_name}", self.gcp_bucket_name)
+        start_script = start_script.replace("{gcp_auth_file}", self.gcp_auth_file)
+        start_script = start_script.replace("{script_args}", script_args)
+        start_script = start_script.replace("{terminate}", json.dumps(self.terminate_on_end))
+        start_script = start_script.replace("{use_gpu}", json.dumps(self.use_gpu))
+        print("script length", len(base64.b64encode(start_script.encode()).decode("utf-8")))
+        return base64.b64encode(start_script.encode()).decode("utf-8")
+
+    def create_instance(self, vm_parameters, name, exp_name="", exp_prefix="", dry=False, wait=False):
+        from azure.mgmt.compute import ComputeManagementClient
+        from azure.mgmt.resource import ResourceManagementClient
+
+        resource_client = ResourceManagementClient(self.credentials, self.subscription_id)
+        compute_client = ComputeManagementClient(self.credentials, self.subscription_id)
+
+        # Create Resource Group
+        rg_update = resource_client.resource_groups.create_or_update(self.azure_group_name, {'location': self.location})
+
+        # Read script
+        with open(azure_util.AZURE_STARTUP_SCRIPT_PATH) as f:
+            raw_script = f.read()
+        async_vm_creation = compute_client.virtual_machines.begin_create_or_update(self.azure_group_name, name, vm_parameters)
+
+
+        # ### Assign MSI role
+        # msi_accounts_to_assign = []
+        # if azure_util.SYSTEM_ASSIGNED_IDENTITY:
+        #     msi_accounts_to_assign.append(vm_result.identity.principal_id)
+        # if azure_util.USER_ASSIGNED_IDENTITY:
+        #     msi_accounts_to_assign.append(user_assigned_identity.principal_id)
+
+        # ### Get "Contributor" built-in role as a RoleDefinition object
+        # role_names = ['Contributor', 'Storage Blob Data Contributor']
+        # roles = []
+        # for name in role_names:
+        #     roles += list(authorization_client.role_definitions.list(rg_update.id, filter="roleName eq '{}'".format(name)))
+
+        # ### Add RG scope to the MSI token
+        # for msi_identity in msi_accounts_to_assign:
+        #     for role in roles:
+        #         try:
+        #             role_assignment = authorization_client.role_assignments.create(
+        #                 rg_update.id,
+        #                 uuid.uuid4(), # Role assignment random name
+        #                 {
+        #                     'role_definition_id': role.id,
+        #                     'principal_id': msi_identity
+        #                 }
+        #             )
+        #         except Exception as e:
+        #             print("Error", e)
+
+        # # Tag the VM
+        # async_vm_update = compute_client.virtual_machines.begin_create_or_update(
+        #     self.azure_group_name,
+        #     name,
+        #     {
+        #         'location': self.location,
+        #         'tags': {
+        #             'who-rocks': 'python',
+        #             'where': 'on azure'
+        #         }
+        #     }
+        # )
+        # try:
+        #     async_vm_update.wait()
+        # except Exception as e:
+        #     print("Status", async_vm_update.status())
+        #     print("Error", e)
+
+        if wait:
+            try:
+                async_vm_creation.wait()
+            except Exception as e:
+                print("Status", async_vm_creation.status())
+                print("Error", e)
+                return
+            vm_result = async_vm_creation.result()
+            return vm_result
+        else:
+            return async_vm_creation
+        #return vm_result
+
+
+    def create_network(self):
+        from azure.mgmt.network import NetworkManagementClient
+
+        # network_client = NetworkManagementClient(self.credentials, self.subscription_id)
+        network_client = NetworkManagementClient(
+            credential=self.credentials,
+            subscription_id=self.subscription_id
+        )
+        nic_name = self.unique_name + '-nic'
+        subnet_name = self.unique_name + '-subnet'
+
+        vnet_name = self.unique_name + '-vnet'
+        ip_name = self.azure_group_name + '-ip'
+        ip_config_name = self.azure_group_name + '-ip-config'
+
+        async_vnet_creation = network_client.virtual_networks.begin_create_or_update(
+            self.azure_group_name,
+            vnet_name,
+            {
+                'location': self.location,
+                'address_space': {
+                    'address_prefixes': ['10.0.0.0/16']
+                }
+            }
+        )
+        async_vnet_creation.wait()
+        # Create Subnet
+        async_subnet_creation = network_client.subnets.begin_create_or_update(
+            self.azure_group_name,
+            vnet_name,
+            subnet_name,
+            {'address_prefix': '10.0.0.0/24'}
+        )
+        subnet_info = async_subnet_creation.result()
+        # Create IP
+        # async_ip_creation = network_client.public_ip_addresses.begin_create_or_update(self.azure_group_name,
+        #     ip_name,
+        #     {
+        #         "location": self.location,
+        #         "sku": { "name": "Standard" },
+        #         "public_ip_allocation_method": "Static",
+        #         "public_ip_address_version" : "IPV4"
+        #     }
+        # )
+        # ip_address_result = async_ip_creation.result()
+        # Create NIC
+        async_nic_creation = network_client.network_interfaces.begin_create_or_update(
+            self.azure_group_name,
+            nic_name,
+            {
+                'location': self.location,
+                'ip_configurations': [{
+                    'name': ip_config_name,
+                    'subnet': {
+                        'id': subnet_info.id
+                    },
+                    # "public_ip_address": {"id": ip_address_result.id }
+                }]
+            }
+        )
+        # result = async_nic_creation.result()
+        # return result.id
+        return f'/subscriptions/{self.subscription_id}/resourceGroups/{self.azure_group_name}/providers/Microsoft.Network/networkInterfaces/' + nic_name
 
 class GCPMode(LaunchMode):
     """
@@ -407,7 +762,7 @@ class GCPMode(LaunchMode):
         zone (str): GCE compute zone.
         instance_type (str): GCE instance type
     """
-    def __init__(self, 
+    def __init__(self,
                  gcp_project,
                  gcp_bucket,
                  gcp_log_path,
