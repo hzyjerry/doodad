@@ -6,6 +6,7 @@
 
 {
     storage_name={storage_name}
+    subscription_id={subscription_id}
     #storage_data_path={storage_data_path}
     #storage_logs_path={storage_logs_path}
     shell_interpreter={shell_interpreter}
@@ -16,7 +17,10 @@
     gcp_bucket_name={gcp_bucket_name}
     gcp_bucket_path={gcp_bucket_path}
     gcp_auth_file={gcp_auth_file}
-    instance_name=$(curl -H Metadata:true "http://169.254.169.254/metadata/instance/compute/vmId?api-version=2017-08-01&format=text")
+    # curl -H Metadata:true "http://169.254.169.254/metadata/instance/compute"
+    instance_name=$(curl -H Metadata:true "http://169.254.169.254/metadata/instance/compute/name?api-version=2017-08-01&format=text")
+    group_name=$(curl -H Metadata:true "http://169.254.169.254/metadata/instance/compute/resourceGroupName?api-version=2017-08-01&format=text")
+    # instance_name={instance_name}
     echo "storage_name:" $storage_name
     # echo "storage_data_path:" $storage_data_path
     # echo "storage_logs_path:" $storage_logs_path
@@ -33,7 +37,10 @@
 
     # Install azure command CLI
     curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+    # az login --identity -u  /subscriptions/$subscription_id/resourcegroups/myRG/providers/Microsoft.ManagedIdentity/userAssignedIdentities/myID  --allow-no-subscriptions
     az login --identity
+    echo "login subscription /subscriptions/${subscription_id}/resourcegroups/myRG/providers/Microsoft.ManagedIdentity/userAssignedIdentities/myID"
+
 
     # Install AZCopy
     wget https://aka.ms/downloadazcopy-v10-linux
@@ -124,8 +131,10 @@
 
     if [ "$terminate" = "true" ]; then
         echo "Finished experiment. Terminating"
-        zone=$(curl http://metadata/computeMetadata/v1/instance/zone -H "Metadata-Flavor: Google")
-        zone="${zone##*/}"
-        gcloud compute instances delete $instance_name --zone $zone --quiet
+
+        ## Shutdown vm
+        az vm delete -g ${group_name} -n ${instance_name} --yes
     fi
+
+
 } >> /tmp/user_data.log 2>&1

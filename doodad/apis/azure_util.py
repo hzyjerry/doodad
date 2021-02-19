@@ -16,7 +16,7 @@ storage = safe_import.try_import('google.cloud.storage')
 
 AZURE_STARTUP_SCRIPT_PATH = os.path.join(REPO_DIR, "scripts/azure/azure_startup_script.sh")
 AZURE_SHUTDOWN_SCRIPT_PATH = os.path.join(REPO_DIR, "scripts/azure/azure_shutdown_script.sh")
-USER_ASSIGNED_IDENTITY = True
+USER_ASSIGNED_IDENTITY = False
 SYSTEM_ASSIGNED_IDENTITY = True
 
 

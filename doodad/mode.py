@@ -39,7 +39,7 @@ class LaunchMode(object):
         self.async_run = async_run
         self.use_gpu = use_gpu
 
-    def run_script(self, script_filename, dry=False, return_output=False, verbose=False):
+    def run_script(self, script_filename, dry=False, return_output=False, verbose=True):
         """
         Runs a shell script.
 
@@ -132,7 +132,7 @@ class EC2Mode(LaunchMode):
         lines = [l.strip() for l in s.split('\n')]
         return '\n'.join(lines)
 
-    def run_script(self, script_name, dry=False, return_output=False, verbose=False):
+    def run_script(self, script_name, dry=False, return_output=False, verbose=True):
         if return_output:
             raise ValueError("Cannot return output for AWS scripts.")
 
@@ -423,16 +423,18 @@ class AzureMode(LaunchMode):
                  #azure_image='ubuntu-1804-bionic-v20181222',
                  disk_size=64,
                  terminate_on_end=True,
-                 instance_type='f1-micro',
+                 instance_type='STANDARD_D4_V3',
                  azure_label='azure_doodad',
                  # storage_data_path='doodad-data',
                  # storage_logs_path='doodad-logs',
                  gcp_bucket_name="",
                  gcp_bucket_path="",
                  gcp_auth_file="",
+                 use_spot=False,
                  location='eastus',
                  username='doodad',
                  password='doodad@123',
+                 auto_shutdown=None,
                  **kwargs):
         from azure.identity import DefaultAzureCredential
 
@@ -444,6 +446,8 @@ class AzureMode(LaunchMode):
         self.terminate_on_end = terminate_on_end
         self.use_gpu = False
         self.azure_label = azure_label
+        self.instance_type = instance_type
+        self.use_spot = use_spot
         # self.storage_data_path = storage_data_path
         # self.storage_logs_path = storage_logs_path
         self.gcp_bucket_path = gcp_bucket_path
@@ -452,8 +456,9 @@ class AzureMode(LaunchMode):
         self.location = location
         self.username = username
         self.password = password
+        self.auto_shutdown = auto_shutdown
         # instance name must match regex '(?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)'">
-        self.unique_name= "doodad" + str(uuid.uuid4()).replace("-", "")
+        self.unique_name = "doodad" + str(uuid.uuid4()).replace("-", "")
 
         ## Credentials
         self.subscription_id = os.environ.get("AZURE_SUBSCRIPTION_ID", "<subscription_id>")
@@ -475,7 +480,7 @@ class AzureMode(LaunchMode):
     def print_launch_message(self):
         pass
 
-    def run_script(self, script, dry=False, return_output=False, verbose=False, wait=False):
+    def run_script(self, script, dry=False, return_output=False, verbose=True, wait=False):
         if return_output:
             raise NotImplementedError()
 
@@ -511,7 +516,7 @@ class AzureMode(LaunchMode):
 
         print("Creating msi")
         t1 = time.time()
-        msi_identity = self.create_msi()
+        msi_identity, msi_accounts = self.create_msi()
         print("Created msi", time.time() - t1)
 
         vm_parameters = {
@@ -524,7 +529,7 @@ class AzureMode(LaunchMode):
             },
             'hardware_profile': {
                 #'vm_size': 'Standard_DS1'
-                'vm_size': 'STANDARD_D4_V3'
+                'vm_size': self.instance_type
             },
             'storage_profile': {
                 'image_reference': {
@@ -532,18 +537,7 @@ class AzureMode(LaunchMode):
                     'offer': self.vm_reference['linux']['offer'],
                     'sku': self.vm_reference['linux']['sku'],
                     'version': self.vm_reference['linux']['version']
-                },
-                # 'os_disk': {
-                #     'name': unique_name + '-osdisk',
-                #     'caching': 'None',
-                #     'create_option': 'Empty',
-                #     # 'create_option': 'fromImage',
-                #     # 'vhd': {
-                #     #     'uri': 'https://jerryassisted.blob.core.windows.net/vhds/jerry-assisted-reward-designsoft-paper-2857.vhd'
-                #     #     # 'uri': 'https://{}.blob.core.windows.net/vhds/{}.vhd'.format(
-                #     #     #     self.azure_storage, unique_name+haikunator.haikunate())
-                #     # }
-                # },
+                }
             },
             'network_profile': {
                 'network_interfaces': [{
@@ -552,13 +546,33 @@ class AzureMode(LaunchMode):
             },
             'identity': msi_identity
         }
-        print("Creating vm")
+        if self.use_spot:
+            from azure.mgmt.compute.models import VirtualMachinePriorityTypes, VirtualMachineEvictionPolicyTypes, BillingProfile
+            vm_parameters['priority'] = VirtualMachinePriorityTypes.spot, # use Azure spot intance
+            vm_parameters['eviction_policy'] = VirtualMachineEvictionPolicyTypes.deallocate , #For Azure Spot virtual machines, the only supported value is 'Deallocate'
+            vm_parameters['billing_profile'] = BillingProfile(max_price=float(2))
+        print("Creating vm", self.unique_name)
         t1 = time.time()
         vm_result = self.create_instance(vm_parameters, self.unique_name, exp_name, exp_prefix, dry=dry, wait=wait)
         print("Created vm", time.time() - t1)
+        print('Launched instance %s' % self.unique_name)
 
-        if verbose:
-            print('Launched instance %s' % self.unique_name)
+        if azure_util.SYSTEM_ASSIGNED_IDENTITY:
+            msi_accounts.append(vm_result.identity.principal_id)
+        self.assign_msi(msi_accounts)
+        # if self.auto_shutdown:
+        #     import datetime
+        #     from datetime import timezone
+        #     from azure.cli.core import get_default_cli
+
+        #     dt = datetime.datetime.now()
+        #     utc_time = dt.replace(tzinfo = timezone.utc)
+        #     utc_time += datetime.timedelta(minutes=self.auto_shutdown)
+        #     time_close = utc_time.strftime('%H%M')
+        #     cmd = f"az vm auto-shutdown -g {self.azure_group_name} -n {self.unique_name} --time {time_close}"
+        #     print(f"Auto shutdown: {cmd}")
+        #     get_default_cli()(cmd.split())
+
         return vm_result
 
     def create_msi(self):
@@ -569,6 +583,7 @@ class AzureMode(LaunchMode):
 
         params_identity = {'principal_id': []}
         msi_client = ManagedServiceIdentityClient(self.cred_wrapper, self.subscription_id)
+
         if azure_util.USER_ASSIGNED_IDENTITY:
             # Create a User Assigned Identity if needed
             print("\nCreate User Assigned Identity")
@@ -577,6 +592,7 @@ class AzureMode(LaunchMode):
                 "myMsiIdentity",  # Any name, just a human readable ID
                 self.location
             )
+            print(f"Principal id {user_assigned_identity.principal_id}")
             params_identity['principal_id'].append(user_assigned_identity.principal_id)
             azure_util.print_item(user_assigned_identity)
         if azure_util.USER_ASSIGNED_IDENTITY and azure_util.SYSTEM_ASSIGNED_IDENTITY:
@@ -591,11 +607,50 @@ class AzureMode(LaunchMode):
             }
         elif azure_util.SYSTEM_ASSIGNED_IDENTITY:  # System assigned only
             params_identity['type'] = ResourceIdentityType.system_assigned
-        return params_identity
+
+
+        ### Assign MSI role
+        msi_accounts_to_assign = []
+        if azure_util.USER_ASSIGNED_IDENTITY:
+            msi_accounts_to_assign.append(user_assigned_identity.principal_id)
+        return params_identity, msi_accounts_to_assign
+
+
+    def assign_msi(self, msi_accounts):
+        ### Get "Contributor" built-in role as a RoleDefinition object
+        from azure.mgmt.resource import ResourceManagementClient
+        # from azure.mgmt.authorization import AuthorizationManagementClient
+        from azure.mgmt.authorization.v2018_01_01_preview import AuthorizationManagementClient
+        authorization_client = AuthorizationManagementClient(self.credentials, self.subscription_id)
+        resource_client = ResourceManagementClient(self.credentials, self.subscription_id)
+        rg_update = resource_client.resource_groups.create_or_update(self.azure_group_name, {'location': self.location})
+
+        role_names = ['Contributor', 'Reader', 'Virtual Machine']
+        roles = []
+        for name in role_names: roles += list(authorization_client.role_definitions.list(rg_update.id, filter="roleName eq '{}'".format(name)))
+
+        ### Add RG scope to the MSI token
+        for msi_identity in msi_accounts:
+            for role in roles:
+                try:
+                    role_assignment = authorization_client.role_assignments.create(
+                        rg_update.id, # scope
+                        uuid.uuid4(), # Role assignment random name
+                        {
+                            'role_definition_id': role.id,
+                            'principal_id': msi_identity
+                        }
+                    )
+                except Exception as e:
+                    print("Error", e)
+        # import pdb; pdb.set_trace()
+
 
     def process_script(self, raw_script, script_args='', remote_script_path=''):
         start_script = raw_script.replace("{exp_name}", "123")
         start_script = start_script.replace("{storage_name}", self.azure_storage)
+        start_script = start_script.replace("{subscription_id}", self.subscription_id)
+        # start_script = start_script.replace("{instance_name}", self.unique_name)
         # start_script = start_script.replace("{storage_logs_path}", self.storage_logs_path)
         # start_script = start_script.replace("{storage_data_path}", self.storage_data_path)
         start_script = start_script.replace("{shell_interpreter}", self.shell_interpreter)
@@ -609,50 +664,7 @@ class AzureMode(LaunchMode):
         print("script length", len(base64.b64encode(start_script.encode()).decode("utf-8")))
         return base64.b64encode(start_script.encode()).decode("utf-8")
 
-    def create_instance(self, vm_parameters, name, exp_name="", exp_prefix="", dry=False, wait=False):
-        from azure.mgmt.compute import ComputeManagementClient
-        from azure.mgmt.resource import ResourceManagementClient
-
-        resource_client = ResourceManagementClient(self.credentials, self.subscription_id)
-        compute_client = ComputeManagementClient(self.credentials, self.subscription_id)
-
-        # Create Resource Group
-        rg_update = resource_client.resource_groups.create_or_update(self.azure_group_name, {'location': self.location})
-
-        # Read script
-        with open(azure_util.AZURE_STARTUP_SCRIPT_PATH) as f:
-            raw_script = f.read()
-        async_vm_creation = compute_client.virtual_machines.begin_create_or_update(self.azure_group_name, name, vm_parameters)
-
-
-        # ### Assign MSI role
-        # msi_accounts_to_assign = []
-        # if azure_util.SYSTEM_ASSIGNED_IDENTITY:
-        #     msi_accounts_to_assign.append(vm_result.identity.principal_id)
-        # if azure_util.USER_ASSIGNED_IDENTITY:
-        #     msi_accounts_to_assign.append(user_assigned_identity.principal_id)
-
-        # ### Get "Contributor" built-in role as a RoleDefinition object
-        # role_names = ['Contributor', 'Storage Blob Data Contributor']
-        # roles = []
-        # for name in role_names:
-        #     roles += list(authorization_client.role_definitions.list(rg_update.id, filter="roleName eq '{}'".format(name)))
-
-        # ### Add RG scope to the MSI token
-        # for msi_identity in msi_accounts_to_assign:
-        #     for role in roles:
-        #         try:
-        #             role_assignment = authorization_client.role_assignments.create(
-        #                 rg_update.id,
-        #                 uuid.uuid4(), # Role assignment random name
-        #                 {
-        #                     'role_definition_id': role.id,
-        #                     'principal_id': msi_identity
-        #                 }
-        #             )
-        #         except Exception as e:
-        #             print("Error", e)
-
+    def tag_instance(self):
         # # Tag the VM
         # async_vm_update = compute_client.virtual_machines.begin_create_or_update(
         #     self.azure_group_name,
@@ -670,20 +682,26 @@ class AzureMode(LaunchMode):
         # except Exception as e:
         #     print("Status", async_vm_update.status())
         #     print("Error", e)
+        pass
 
-        if wait:
-            try:
-                async_vm_creation.wait()
-            except Exception as e:
-                print("Status", async_vm_creation.status())
-                print("Error", e)
-                return
-            vm_result = async_vm_creation.result()
-            return vm_result
-        else:
-            return async_vm_creation
-        #return vm_result
+    def create_instance(self, vm_parameters, name, exp_name="", exp_prefix="", dry=False, wait=False):
+        from azure.mgmt.compute import ComputeManagementClient
 
+        compute_client = ComputeManagementClient(self.credentials, self.subscription_id)
+
+        # Read script
+        with open(azure_util.AZURE_STARTUP_SCRIPT_PATH) as f:
+            raw_script = f.read()
+        async_vm_creation = compute_client.virtual_machines.begin_create_or_update(self.azure_group_name, name, vm_parameters)
+
+        try:
+            async_vm_creation.wait()
+        except Exception as e:
+            print("Status", async_vm_creation.status())
+            print("Error", e)
+            return
+        vm_result = async_vm_creation.result()
+        return vm_result
 
     def create_network(self):
         from azure.mgmt.network import NetworkManagementClient
@@ -811,7 +829,7 @@ class GCPMode(LaunchMode):
     def print_launch_message(self):
         print('Go to https://console.cloud.google.com/compute to monitor jobs.')
 
-    def run_script(self, script, dry=False, return_output=False, verbose=False):
+    def run_script(self, script, dry=False, return_output=False, verbose=True):
         if return_output:
             raise ValueError("Cannot return output for GCP scripts.")
 
@@ -847,8 +865,8 @@ class GCPMode(LaunchMode):
         # instance name must match regex '(?:[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?)'">
         unique_name= "doodad" + str(uuid.uuid4()).replace("-", "")
         instance_info = self.create_instance(metadata, unique_name, exp_name, exp_prefix, dry=dry)
+        print('Launched instance %s' % unique_name)
         if verbose:
-            print('Launched instance %s' % unique_name)
             print(instance_info)
         return metadata
 
@@ -977,7 +995,7 @@ class SlurmScriptMode(LaunchMode):
     def __str__(self):
         return 'Slurm-Script-%s' % self.local_directory_for_scripts
 
-    def run_script(self, script, dry=False, return_output=False, verbose=False):
+    def run_script(self, script, dry=False, return_output=False, verbose=True):
         self.save_job_script(script)
         self.create_slurm_script(script)
         return 'Launch script save to: {}'.format(self.slurm_script_file_path)
@@ -1057,7 +1075,7 @@ class BrcHighThroughputMode(SlurmScriptMode):
         self.overwrite_task_script = overwrite_task_script
         self.verbose_task_script_update = verbose_task_script_update
 
-    def run_script(self, script, dry=False, return_output=False, verbose=False):
+    def run_script(self, script, dry=False, return_output=False, verbose=True):
         self.save_job_script(script)
         self.create_task_file(script)
         self.create_slurm_script(script)
